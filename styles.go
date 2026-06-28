@@ -37,3 +37,41 @@ var (
 
 	hintStyle = lipgloss.NewStyle().Foreground(colorPending).Italic(true)
 )
+
+const cardWidth = 44
+
+var (
+	cardTitleStyle = lipgloss.NewStyle().
+			Foreground(colorHeader).
+			Bold(true)
+
+	cardDescStyle = lipgloss.NewStyle().Foreground(colorPending)
+
+	cardMetaStyle = lipgloss.NewStyle().Foreground(colorMode)
+
+	cardSelected = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorMode).
+			Width(cardWidth).
+			Padding(0, 2)
+
+	cardUnselected = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorBorder).
+			Width(cardWidth).
+			Padding(0, 2)
+
+	toastBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorDone).
+			Padding(0, 2).
+			MarginLeft(1)
+
+	sudoBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorMode).
+			Padding(1, 2)
+
+	pwPromptStyle = lipgloss.NewStyle().Foreground(colorHeader).Bold(true)
+	pwErrStyle    = lipgloss.NewStyle().Foreground(colorError)
+)

@@ -8,26 +8,35 @@ import (
 
 	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 )
 
 const (
 	screenSelect = "select"
+	screenSudo   = "sudo"
 	screenRun    = "running"
 	screenDone   = "done"
 	screenError  = "error"
 )
 
 type model struct {
-	screen    string
-	modeIdx   int
-	tasks     []Task
-	current   int
+	screen   string
+	modeIdx  int
+	tasks    []Task
+	current  int
+	checking bool
+
 	startTime time.Time
 	endTime   time.Time
 	errMsg    string
-	spinner   spinner.Model
-	progress  progress.Model
+
+	sudoMode string
+	sudoErr  string
+	pwInput  textinput.Model
+
+	spinner  spinner.Model
+	progress progress.Model
 }
 
 type taskDoneMsg struct{ idx int }
@@ -36,6 +45,12 @@ type taskErrorMsg struct {
 	err error
 	out string
 }
+type sudoCheckMsg struct{ needed bool }
+type sudoResultMsg struct {
+	ok  bool
+	err error
+}
+type toastTimeoutMsg struct{}
 
 func initialModel() model {
 	s := spinner.New(
@@ -47,15 +62,21 @@ func initialModel() model {
 		progress.WithScaled(true),
 		progress.WithColors(colorHeader, colorMode),
 	)
+	ti := textinput.New()
+	ti.Prompt = "Password: "
+	ti.EchoMode = textinput.EchoPassword
+	ti.EchoCharacter = '*'
+	ti.CharLimit = 128
 	return model{
 		screen:   screenSelect,
 		spinner:  s,
 		progress: p,
+		pwInput:  ti,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return func() tea.Msg { return m.spinner.Tick() }
+	return nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -65,35 +86,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		case "up", "k":
-			if m.screen == screenSelect && m.modeIdx > 0 {
-				m.modeIdx--
-			}
-		case "down", "j":
-			if m.screen == screenSelect && m.modeIdx < 1 {
-				m.modeIdx++
-			}
-		case "enter":
-			if m.screen == screenSelect {
-				if m.modeIdx == 0 {
-					m.tasks = ShallowTasks()
-				} else {
-					m.tasks = DeepTasks()
-				}
-				m.screen = screenRun
-				m.startTime = time.Now()
-				m.current = 0
-				m.tasks[0].Status = StatusRunning
-				return m, tea.Batch(m.runTask(0), func() tea.Msg { return m.spinner.Tick() })
-			}
-		default:
-			if m.screen == screenDone || m.screen == screenError {
-				return m, tea.Quit
-			}
+		if m.screen == screenSudo {
+			return m.updateSudoKeys(msg)
 		}
+		return m.updateGlobalKeys(msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -105,6 +101,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.progress, cmd = m.progress.Update(msg)
 		return m, cmd
 
+	case sudoCheckMsg:
+		m.checking = false
+		if msg.needed {
+			m.screen = screenSudo
+			return m, m.pwInput.Focus()
+		}
+		return m, m.startRunning()
+
+	case sudoResultMsg:
+		if msg.ok {
+			m.sudoErr = ""
+			m.pwInput.SetValue("")
+			return m, m.startRunning()
+		}
+		m.sudoErr = "authentication failed"
+		m.pwInput.SetValue("")
+		return m, m.pwInput.Focus()
+
 	case taskDoneMsg:
 		m.tasks[msg.idx].Status = StatusDone
 		next := msg.idx + 1
@@ -112,7 +126,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if next >= len(m.tasks) {
 			m.endTime = time.Now()
 			m.screen = screenDone
-			return m, m.progress.SetPercent(1.0)
+			return m, tea.Batch(
+				m.progress.SetPercent(1.0),
+				tea.Tick(3*time.Second, func(time.Time) tea.Msg { return toastTimeoutMsg{} }),
+			)
 		}
 		m.current = next
 		m.tasks[next].Status = StatusRunning
@@ -128,8 +145,83 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = msg.err.Error()
 		}
 		return m, nil
+
+	case toastTimeoutMsg:
+		return m, tea.Quit
 	}
 	return m, nil
+}
+
+func (m model) updateGlobalKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "up", "k":
+		if m.screen == screenSelect && !m.checking && m.modeIdx > 0 {
+			m.modeIdx--
+		}
+	case "down", "j":
+		if m.screen == screenSelect && !m.checking && m.modeIdx < 1 {
+			m.modeIdx++
+		}
+	case "enter":
+		if m.screen == screenSelect && !m.checking {
+			if m.modeIdx == 0 {
+				m.tasks = ShallowTasks()
+				m.sudoMode = "shallow"
+			} else {
+				m.tasks = DeepTasks()
+				m.sudoMode = "deep"
+			}
+			m.checking = true
+			return m, tea.Batch(checkSudo(), func() tea.Msg { return m.spinner.Tick() })
+		}
+	default:
+		if m.screen == screenDone || m.screen == screenError {
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m model) updateSudoKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "enter":
+		pw := m.pwInput.Value()
+		m.pwInput.SetValue("")
+		m.sudoErr = ""
+		return m, validateSudo(pw)
+	default:
+		var cmd tea.Cmd
+		m.pwInput, cmd = m.pwInput.Update(msg)
+		return m, cmd
+	}
+}
+
+func (m *model) startRunning() tea.Cmd {
+	m.screen = screenRun
+	m.startTime = time.Now()
+	m.current = 0
+	m.tasks[0].Status = StatusRunning
+	return tea.Batch(m.runTask(0), func() tea.Msg { return m.spinner.Tick() })
+}
+
+func checkSudo() tea.Cmd {
+	return func() tea.Msg {
+		err := exec.Command("sudo", "-n", "true").Run()
+		return sudoCheckMsg{needed: err != nil}
+	}
+}
+
+func validateSudo(pw string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("sudo", "-S", "-v")
+		cmd.Stdin = strings.NewReader(pw + "\n")
+		err := cmd.Run()
+		return sudoResultMsg{ok: err == nil, err: err}
+	}
 }
 
 func (m model) runTask(idx int) tea.Cmd {
@@ -149,6 +241,8 @@ func (m model) View() tea.View {
 	switch m.screen {
 	case screenSelect:
 		s = m.selectView()
+	case screenSudo:
+		s = m.sudoView()
 	case screenRun:
 		s = m.runView()
 	case screenDone:
@@ -161,30 +255,58 @@ func (m model) View() tea.View {
 	return v
 }
 
+func renderCard(selected bool, icon, title, desc, meta string) string {
+	style := cardUnselected
+	marker := " "
+	if selected {
+		style = cardSelected
+		marker = "▶"
+	}
+	content := fmt.Sprintf("%s %s\n   %s\n   %s",
+		cursorStyle.Render(marker),
+		cardTitleStyle.Render(icon+"  "+title),
+		cardDescStyle.Render(desc),
+		cardMetaStyle.Render(meta),
+	)
+	return style.Render(content)
+}
+
 func (m model) selectView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("🧹  Ubuntu Cleanup CLI"))
 	b.WriteString("\n\n")
-	b.WriteString("Select cleanup mode:\n\n")
 
-	modes := []struct {
-		icon string
-		name string
-		desc string
-	}{
-		{"🌿", "Shallow Clean", "Fast daily cleanup (~20s)"},
-		{"🔥", "Deep Clean", "Full system cleanup (~90s)"},
+	if m.checking {
+		b.WriteString(runStyle.Render(m.spinner.View()))
+		b.WriteString("  Checking sudo access...")
+		b.WriteString("\n\n")
+		b.WriteString(hintStyle.Render("please wait"))
+		return boxStyle.Render(b.String())
 	}
-	for i, mode := range modes {
-		cursor := "   "
-		if i == m.modeIdx {
-			cursor = cursorStyle.Render("▶  ")
-		}
-		b.WriteString(fmt.Sprintf("%s%s  %s\n", cursor, mode.icon, mode.name))
-		b.WriteString(fmt.Sprintf("       %s\n\n", mode.desc))
-	}
+
+	b.WriteString("Select cleanup mode:\n\n")
+	b.WriteString(renderCard(m.modeIdx == 0, "🌿", "Shallow Clean",
+		"Fast daily cleanup (~20s)", "5 tasks · safe for everyday use"))
+	b.WriteString("\n")
+	b.WriteString(renderCard(m.modeIdx == 1, "🔥", "Deep Clean",
+		"Full system cleanup (~90s)", "12 tasks · requires sudo"))
+	b.WriteString("\n\n")
 	b.WriteString(hintStyle.Render("↑↓ navigate   enter select   q quit"))
 	return boxStyle.Render(b.String())
+}
+
+func (m model) sudoView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("🔒  Sudo password required"))
+	b.WriteString("\n\n")
+	b.WriteString(m.pwInput.View())
+	if m.sudoErr != "" {
+		b.WriteString("\n")
+		b.WriteString(pwErrStyle.Render(m.sudoErr))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(hintStyle.Render("enter submit · ctrl+c cancel"))
+	return sudoBoxStyle.Render(b.String())
 }
 
 func (m model) runView() string {
@@ -224,19 +346,14 @@ func (m model) runView() string {
 }
 
 func (m model) doneView() string {
+	count := len(m.tasks)
+	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("✨  Cleanup Complete!"))
-	b.WriteString("\n\n")
-	for _, t := range m.tasks {
-		b.WriteString(fmt.Sprintf("  %s  %s\n", doneStyle.Render("✅"), doneStyle.Render(t.Name)))
-	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("  %s  %d/%d ✓\n", m.progress.View(), len(m.tasks), len(m.tasks)))
-	b.WriteString("\n")
-	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
-	b.WriteString(fmt.Sprintf("🎉  Your system is fresh and clean!\n     Time taken: %s\n\n", elapsed))
-	b.WriteString(hintStyle.Render("press any key to exit"))
-	return boxStyle.Render(b.String())
+	b.WriteString(cardMetaStyle.Render(fmt.Sprintf("%d/%d tasks · %s", count, count, elapsed)))
+	toast := toastBoxStyle.Render(b.String())
+	return toast + "\n" + hintStyle.Render("press any key to exit (or wait 3s)")
 }
 
 func (m model) errorView() string {
@@ -260,7 +377,7 @@ func (m model) errorView() string {
 	}
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("  Error: %s\n", errStyle.Render(m.errMsg)))
-	b.WriteString(fmt.Sprintf("  %s\n", hintStyle.Render("Tip: ensure passwordless sudo is configured (visudo)")))
+	b.WriteString(fmt.Sprintf("  %s\n", hintStyle.Render("Tip: ensure sudo is available and disk is writable")))
 	b.WriteString("\n")
 	b.WriteString(hintStyle.Render("press any key to exit"))
 	return boxStyle.Render(b.String())

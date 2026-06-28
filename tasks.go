@@ -19,7 +19,7 @@ func ShallowTasks() []Task {
 	return []Task{
 		{Name: "Clear Trash", Command: "rm -rf ~/.local/share/Trash/*"},
 		{Name: "Clear User Cache", Command: "rm -rf ~/.cache/*"},
-		{Name: "Remove .tmp files", Command: `find /tmp ~/.cache -name "*.tmp" -delete`},
+		{Name: "Remove .tmp files", Command: "find /tmp ~/.cache -name \"*.tmp\" -delete 2>/dev/null || true"},
 		{Name: "Vacuum journals (7 days)", Command: "sudo journalctl --vacuum-time=7d"},
 		{Name: "APT autoclean", Command: "sudo apt autoclean"},
 	}
@@ -35,7 +35,7 @@ func DeepTasks() []Task {
 		{Name: "APT autoclean + clean", Command: "sudo apt autoclean && sudo apt clean"},
 		{Name: "Clear /tmp and /var/tmp", Command: "sudo rm -rf /tmp/* /var/tmp/*"},
 		{Name: "Clear user cache + trash", Command: "rm -rf ~/.cache/* ~/.local/share/Trash/*"},
-		{Name: "Remove .tmp files", Command: `find /tmp ~/.cache ~/.local -name "*.tmp" -delete 2>/dev/null`},
+		{Name: "Remove .tmp files", Command: "find /tmp ~/.cache ~/.local -name \"*.tmp\" -delete 2>/dev/null || true"},
 		{Name: "Clean npm cache", Command: "npm cache clean --force && rm -rf ~/.npm"},
 		{Name: "Prune pnpm store", Command: "pnpm store prune && rm -rf ~/.pnpm-store"},
 		{Name: "Vacuum journals (3 days)", Command: "sudo journalctl --vacuum-time=3d"},

@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"fmt"
@@ -10,6 +10,8 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/Gazi2050/cleanup/internal/tasks"
 )
 
 const (
@@ -23,7 +25,7 @@ const (
 type model struct {
 	screen   string
 	modeIdx  int
-	tasks    []Task
+	tasks    []tasks.Task
 	current  int
 	checking bool
 
@@ -52,7 +54,7 @@ type sudoResultMsg struct {
 }
 type toastTimeoutMsg struct{}
 
-func initialModel() model {
+func InitialModel() model {
 	s := spinner.New(
 		spinner.WithSpinner(spinner.MiniDot),
 		spinner.WithStyle(runStyle),
@@ -60,7 +62,8 @@ func initialModel() model {
 	p := progress.New(
 		progress.WithoutPercentage(),
 		progress.WithScaled(true),
-		progress.WithColors(colorHeader, colorMode),
+		progress.WithColors(theme.Header, theme.Mode),
+		progress.WithWidth(30),
 	)
 	ti := textinput.New()
 	ti.Prompt = "Password: "
@@ -82,7 +85,7 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.progress.SetWidth(msg.Width - 8)
+		SetTerminalWidth(msg.Width)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -120,7 +123,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.pwInput.Focus()
 
 	case taskDoneMsg:
-		m.tasks[msg.idx].Status = StatusDone
+		m.tasks[msg.idx].Status = tasks.StatusDone
 		next := msg.idx + 1
 		pct := float64(next) / float64(len(m.tasks))
 		if next >= len(m.tasks) {
@@ -132,11 +135,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 		}
 		m.current = next
-		m.tasks[next].Status = StatusRunning
+		m.tasks[next].Status = tasks.StatusRunning
 		return m, tea.Batch(m.runTask(next), m.progress.SetPercent(pct))
 
 	case taskErrorMsg:
-		m.tasks[msg.idx].Status = StatusError
+		m.tasks[msg.idx].Status = tasks.StatusError
 		m.endTime = time.Now()
 		m.screen = screenError
 		if msg.out != "" {
@@ -167,10 +170,10 @@ func (m model) updateGlobalKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.screen == screenSelect && !m.checking {
 			if m.modeIdx == 0 {
-				m.tasks = ShallowTasks()
+				m.tasks = tasks.ShallowTasks()
 				m.sudoMode = "shallow"
 			} else {
-				m.tasks = DeepTasks()
+				m.tasks = tasks.DeepTasks()
 				m.sudoMode = "deep"
 			}
 			m.checking = true
@@ -204,7 +207,7 @@ func (m *model) startRunning() tea.Cmd {
 	m.screen = screenRun
 	m.startTime = time.Now()
 	m.current = 0
-	m.tasks[0].Status = StatusRunning
+	m.tasks[0].Status = tasks.StatusRunning
 	return tea.Batch(m.runTask(0), func() tea.Msg { return m.spinner.Tick() })
 }
 
@@ -213,6 +216,16 @@ func checkSudo() tea.Cmd {
 		err := exec.Command("sudo", "-n", "true").Run()
 		return sudoCheckMsg{needed: err != nil}
 	}
+}
+
+func countDone(list []tasks.Task) int {
+	n := 0
+	for _, t := range list {
+		if t.Status == tasks.StatusDone {
+			n++
+		}
+	}
+	return n
 }
 
 func validateSudo(pw string) tea.Cmd {
@@ -255,50 +268,44 @@ func (m model) View() tea.View {
 	return v
 }
 
-func renderCard(selected bool, icon, title, desc, meta string) string {
-	style := cardUnselected
-	marker := " "
-	if selected {
-		style = cardSelected
-		marker = "▶"
-	}
-	content := fmt.Sprintf("%s %s\n   %s\n   %s",
-		cursorStyle.Render(marker),
-		cardTitleStyle.Render(icon+"  "+title),
-		cardDescStyle.Render(desc),
-		cardMetaStyle.Render(meta),
-	)
-	return style.Render(content)
-}
-
 func (m model) selectView() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("🧹  Ubuntu Cleanup CLI"))
+	b.WriteString(titleStyle.Render("🧹  Linux Cleanup CLI"))
 	b.WriteString("\n\n")
 
 	if m.checking {
-		b.WriteString(runStyle.Render(m.spinner.View()))
-		b.WriteString("  Checking sudo access...")
+		b.WriteString(runStyle.Render(m.spinner.View()) + "  Checking sudo access...")
 		b.WriteString("\n\n")
 		b.WriteString(hintStyle.Render("please wait"))
-		return boxStyle.Render(b.String())
+		return b.String()
 	}
 
 	b.WriteString("Select cleanup mode:\n\n")
-	b.WriteString(renderCard(m.modeIdx == 0, "🌿", "Shallow Clean",
-		"Fast daily cleanup (~20s)", "5 tasks · safe for everyday use"))
-	b.WriteString("\n")
-	b.WriteString(renderCard(m.modeIdx == 1, "🔥", "Deep Clean",
-		"Full system cleanup (~90s)", "12 tasks · requires sudo"))
-	b.WriteString("\n\n")
+	modes := []struct {
+		icon string
+		name string
+		desc string
+		meta string
+	}{
+		{"🌿", "Shallow Clean", "Fast daily cleanup (~20s)", "5 tasks · safe for everyday use"},
+		{"🔥", "Deep Clean", "Full system cleanup (~90s)", "11 tasks · requires sudo"},
+	}
+	for i, mode := range modes {
+		marker := pendStyle.Render("( )")
+		if i == m.modeIdx {
+			marker = cursorStyle.Render("(•)")
+		}
+		b.WriteString(fmt.Sprintf("  %s %s\n", marker, cardTitleStyle.Render(mode.icon+"  "+mode.name)))
+		b.WriteString(fmt.Sprintf("      %s\n", cardDescStyle.Render(mode.desc)))
+		b.WriteString(fmt.Sprintf("      %s\n", cardMetaStyle.Render(mode.meta)))
+		b.WriteString("\n")
+	}
 	b.WriteString(hintStyle.Render("↑↓ navigate   enter select   q quit"))
-	return boxStyle.Render(b.String())
+	return b.String()
 }
 
 func (m model) sudoView() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("🔒  Sudo password required"))
-	b.WriteString("\n\n")
 	b.WriteString(m.pwInput.View())
 	if m.sudoErr != "" {
 		b.WriteString("\n")
@@ -306,25 +313,25 @@ func (m model) sudoView() string {
 	}
 	b.WriteString("\n\n")
 	b.WriteString(hintStyle.Render("enter submit · ctrl+c cancel"))
-	return sudoBoxStyle.Render(b.String())
+	return RenderBox(BoxWarning, "🔒  Sudo password required", b.String())
 }
 
 func (m model) runView() string {
 	var b strings.Builder
-	header := titleStyle.Render("🧹  Ubuntu Cleanup CLI") + "  " + modeBadgeStyle.Render("["+modeName(m.modeIdx)+"]")
-	b.WriteString(header)
+	b.WriteString(titleStyle.Render("🧹  Linux Cleanup CLI") + "  " +
+		modeBadgeStyle.Render("["+tasks.ModeName(m.modeIdx)+"]"))
 	b.WriteString("\n\n")
 
 	for _, t := range m.tasks {
 		var mark, name string
 		switch t.Status {
-		case StatusDone:
+		case tasks.StatusDone:
 			mark = doneStyle.Render("✅")
 			name = doneStyle.Render(t.Name)
-		case StatusRunning:
+		case tasks.StatusRunning:
 			mark = runStyle.Render(m.spinner.View())
 			name = runStyle.Render(t.Name)
-		case StatusError:
+		case tasks.StatusError:
 			mark = errStyle.Render("❌")
 			name = errStyle.Render(t.Name)
 		default:
@@ -334,39 +341,29 @@ func (m model) runView() string {
 		b.WriteString(fmt.Sprintf("  %s  %s\n", mark, name))
 	}
 
-	count := 0
-	for _, t := range m.tasks {
-		if t.Status == StatusDone {
-			count++
-		}
-	}
+	n := len(m.tasks)
+	done := countDone(m.tasks)
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("  %s  %d/%d tasks\n", m.progress.View(), count, len(m.tasks)))
-	return boxStyle.Render(b.String())
+	b.WriteString(m.progress.View() + "  " + pendStyle.Render(fmt.Sprintf("%d/%d tasks", done, n)))
+	return b.String()
 }
 
 func (m model) doneView() string {
 	count := len(m.tasks)
 	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("✨  Cleanup Complete!"))
-	b.WriteString("\n")
-	b.WriteString(cardMetaStyle.Render(fmt.Sprintf("%d/%d tasks · %s", count, count, elapsed)))
-	toast := toastBoxStyle.Render(b.String())
-	return toast + "\n" + hintStyle.Render("press any key to exit (or wait 3s)")
+	body := fmt.Sprintf("%d tasks completed in %s", count, elapsed)
+	return SuccessCard("Done", body) + "\n"
 }
 
 func (m model) errorView() string {
 	var b strings.Builder
-	b.WriteString(errStyle.Render("⚠️   Task Failed"))
-	b.WriteString("\n\n")
 	for _, t := range m.tasks {
 		var mark, name string
 		switch t.Status {
-		case StatusDone:
+		case tasks.StatusDone:
 			mark = doneStyle.Render("✅")
 			name = doneStyle.Render(t.Name)
-		case StatusError:
+		case tasks.StatusError:
 			mark = errStyle.Render("❌")
 			name = errStyle.Render(t.Name + "  ← failed here")
 		default:
@@ -376,9 +373,8 @@ func (m model) errorView() string {
 		b.WriteString(fmt.Sprintf("  %s  %s\n", mark, name))
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("  Error: %s\n", errStyle.Render(m.errMsg)))
-	b.WriteString(fmt.Sprintf("  %s\n", hintStyle.Render("Tip: ensure sudo is available and disk is writable")))
-	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("press any key to exit"))
-	return boxStyle.Render(b.String())
+	b.WriteString(fmt.Sprintf("Error: %s\n", errStyle.Render(m.errMsg)))
+	b.WriteString(hintStyle.Render("Tip: ensure sudo is available and disk is writable"))
+	card := ErrorCard("Task Failed", b.String())
+	return card + "\n" + hintStyle.Render("press any key to exit")
 }

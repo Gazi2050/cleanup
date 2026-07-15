@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -15,11 +17,11 @@ import (
 )
 
 const (
-	screenSelect = "select"
-	screenSudo   = "sudo"
-	screenRun    = "running"
-	screenDone   = "done"
-	screenError  = "error"
+	screenSelect  = "select"
+	screenSudo    = "sudo"
+	screenRun     = "running"
+	screenDone    = "done"
+	screenSummary = "summary"
 )
 
 type model struct {
@@ -31,7 +33,6 @@ type model struct {
 
 	startTime time.Time
 	endTime   time.Time
-	errMsg    string
 
 	sudoMode string
 	sudoErr  string
@@ -39,6 +40,14 @@ type model struct {
 
 	spinner  spinner.Model
 	progress progress.Model
+
+	// failedTasks / skippedTasks track indices that did not complete cleanly.
+	// A run finishes on screenSummary when either is non-empty, otherwise
+	// screenDone.
+	failedTasks  []int
+	skippedTasks []int
+	// lastErr holds the most recent task error text for the summary view.
+	lastErr string
 }
 
 type taskDoneMsg struct{ idx int }
@@ -47,12 +56,16 @@ type taskErrorMsg struct {
 	err error
 	out string
 }
+type taskSkippedMsg struct {
+	idx int
+	msg string
+}
 type sudoCheckMsg struct{ needed bool }
 type sudoResultMsg struct {
 	ok  bool
 	err error
 }
-type toastTimeoutMsg struct{}
+type sudoRefreshMsg struct{}
 
 func InitialModel() model {
 	s := spinner.New(
@@ -124,35 +137,52 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case taskDoneMsg:
 		m.tasks[msg.idx].Status = tasks.StatusDone
-		next := msg.idx + 1
-		pct := float64(next) / float64(len(m.tasks))
-		if next >= len(m.tasks) {
-			m.endTime = time.Now()
-			m.screen = screenDone
-			return m, tea.Batch(
-				m.progress.SetPercent(1.0),
-				tea.Tick(3*time.Second, func(time.Time) tea.Msg { return toastTimeoutMsg{} }),
-			)
-		}
-		m.current = next
-		m.tasks[next].Status = tasks.StatusRunning
-		return m, tea.Batch(m.runTask(next), m.progress.SetPercent(pct))
+		return m.advance(msg.idx)
+
+	case taskSkippedMsg:
+		m.tasks[msg.idx].Status = tasks.StatusSkipped
+		m.skippedTasks = append(m.skippedTasks, msg.idx)
+		return m.advance(msg.idx)
 
 	case taskErrorMsg:
 		m.tasks[msg.idx].Status = tasks.StatusError
-		m.endTime = time.Now()
-		m.screen = screenError
-		if msg.out != "" {
-			m.errMsg = strings.TrimSpace(msg.err.Error() + "\n" + msg.out)
-		} else {
-			m.errMsg = msg.err.Error()
+		m.failedTasks = append(m.failedTasks, msg.idx)
+		m.lastErr = formatTaskError(msg.err, msg.out)
+		return m.advance(msg.idx)
+
+	case sudoRefreshMsg:
+		// Keep the sudo timestamp warm during long runs so a later sudo task
+		// does not hit a stale credential. Purely a side effect; the result
+		// is intentionally ignored — a real failure surfaces as a task error.
+		if m.screen == screenRun {
+			return m, scheduleSudoRefresh()
 		}
 		return m, nil
-
-	case toastTimeoutMsg:
-		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// advance moves to the next runnable task or finishes the run. Tasks already
+// in a terminal state (Done/Skipped/Error) are skipped, which lets a retry
+// re-run only the previously failed tasks without touching the rest.
+func (m model) advance(idx int) (model, tea.Cmd) {
+	next := idx + 1
+	for next < len(m.tasks) && m.tasks[next].Status != tasks.StatusPending {
+		next++
+	}
+	if next >= len(m.tasks) {
+		m.endTime = time.Now()
+		if len(m.failedTasks) == 0 && len(m.skippedTasks) == 0 {
+			m.screen = screenDone
+			return m, tea.Quit
+		}
+		m.screen = screenSummary
+		return m, m.progress.SetPercent(1.0)
+	}
+	pct := float64(next) / float64(len(m.tasks))
+	m.current = next
+	m.tasks[next].Status = tasks.StatusRunning
+	return m, tea.Batch(m.runTask(next), m.progress.SetPercent(pct))
 }
 
 func (m model) updateGlobalKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -179,8 +209,15 @@ func (m model) updateGlobalKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.checking = true
 			return m, tea.Batch(checkSudo(), func() tea.Msg { return m.spinner.Tick() })
 		}
+		if m.screen == screenDone || m.screen == screenSummary {
+			return m, tea.Quit
+		}
+	case "r":
+		if m.screen == screenSummary && len(m.failedTasks) > 0 {
+			return m.retryFailed()
+		}
 	default:
-		if m.screen == screenDone || m.screen == screenError {
+		if m.screen == screenDone || m.screen == screenSummary {
 			return m, tea.Quit
 		}
 	}
@@ -207,8 +244,36 @@ func (m *model) startRunning() tea.Cmd {
 	m.screen = screenRun
 	m.startTime = time.Now()
 	m.current = 0
+	m.failedTasks = nil
+	m.skippedTasks = nil
+	m.lastErr = ""
 	m.tasks[0].Status = tasks.StatusRunning
-	return tea.Batch(m.runTask(0), func() tea.Msg { return m.spinner.Tick() })
+	return tea.Batch(
+		m.runTask(0),
+		func() tea.Msg { return m.spinner.Tick() },
+		scheduleSudoRefresh(),
+	)
+}
+
+// retryFailed resets every failed task to Pending and re-runs from the first
+// one. advance() skips already-resolved tasks, so only the failed tasks
+// actually execute again.
+func (m model) retryFailed() (model, tea.Cmd) {
+	retry := append([]int(nil), m.failedTasks...)
+	m.failedTasks = nil
+	m.lastErr = ""
+	for _, i := range retry {
+		m.tasks[i].Status = tasks.StatusPending
+	}
+	if len(retry) == 0 {
+		return m, nil
+	}
+	first := retry[0]
+	m.current = first
+	m.tasks[first].Status = tasks.StatusRunning
+	m.screen = screenRun
+	m.startTime = time.Now()
+	return m, tea.Batch(m.runTask(first), func() tea.Msg { return m.spinner.Tick() })
 }
 
 func checkSudo() tea.Cmd {
@@ -216,6 +281,15 @@ func checkSudo() tea.Cmd {
 		err := exec.Command("sudo", "-n", "true").Run()
 		return sudoCheckMsg{needed: err != nil}
 	}
+}
+
+// scheduleSudoRefresh fires a silent sudo -n true after the refresh interval
+// to keep the sudo credential timestamp warm. See sudoRefreshMsg.
+func scheduleSudoRefresh() tea.Cmd {
+	return tea.Tick(sudoRefreshInterval, func(time.Time) tea.Msg {
+		_ = exec.Command("sudo", "-n", "true").Run()
+		return sudoRefreshMsg{}
+	})
 }
 
 func countDone(list []tasks.Task) int {
@@ -237,16 +311,72 @@ func validateSudo(pw string) tea.Cmd {
 	}
 }
 
+// taskTimeout picks a generous deadline per command type. apt work can take
+// several minutes during a big upgrade; everything else is capped at a minute
+// so a hung command never freezes the TUI indefinitely.
+func taskTimeout(command string) time.Duration {
+	if strings.Contains(command, "apt ") {
+		return 5 * time.Minute
+	}
+	return 60 * time.Second
+}
+
+// sudoRefreshInterval keeps the sudo timestamp fresh between tasks without
+// spamming. Must be well under the typical sudo timestamp_timeout (5 min).
+const sudoRefreshInterval = 60 * time.Second
+
 func (m model) runTask(idx int) tea.Cmd {
-	task := m.tasks[idx]
+	t := m.tasks[idx]
 	return func() tea.Msg {
-		cmd := exec.Command("sh", "-c", task.Command)
+		if t.Require != "" {
+			if _, err := exec.LookPath(t.Require); err != nil {
+				return taskSkippedMsg{idx: idx, msg: t.Require + " not installed"}
+			}
+		}
+		timeout := taskTimeout(t.Command)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", t.Command)
 		out, err := cmd.CombinedOutput()
+		if ctx.Err() == context.DeadlineExceeded {
+			return taskErrorMsg{idx: idx, err: errors.New("timed out after " + timeout.String()), out: string(out)}
+		}
 		if err != nil {
 			return taskErrorMsg{idx: idx, err: err, out: string(out)}
 		}
 		return taskDoneMsg{idx: idx}
 	}
+}
+
+// formatTaskError strips apt's boilerplate "stable CLI interface" warning and
+// annotates dpkg-lock contention with an actionable hint. Returns a single
+// trimmed string suitable for the summary view.
+func formatTaskError(err error, out string) string {
+	var kept []string
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		if l == "" {
+			continue
+		}
+		if strings.Contains(l, "stable CLI interface") || strings.Contains(l, "Use with caution in scripts") {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	body := strings.Join(kept, "\n")
+
+	if strings.Contains(out, "lock-frontend") || strings.Contains(out, "Could not get lock") {
+		hint := "Another package manager may be running (often unattended-upgrades).\n" +
+			"Stop it: sudo systemctl stop unattended-upgrades"
+		if body == "" {
+			return err.Error() + "\n" + hint
+		}
+		return err.Error() + "\n" + body + "\n" + hint
+	}
+
+	if body == "" {
+		return err.Error()
+	}
+	return err.Error() + "\n" + body
 }
 
 func (m model) View() tea.View {
@@ -260,8 +390,8 @@ func (m model) View() tea.View {
 		s = m.runView()
 	case screenDone:
 		s = m.doneView()
-	case screenError:
-		s = m.errorView()
+	case screenSummary:
+		s = m.summaryView()
 	}
 	v := tea.NewView(s)
 	v.AltScreen = true
@@ -287,8 +417,10 @@ func (m model) selectView() string {
 		desc string
 		meta string
 	}{
-		{"🌿", "Shallow Clean", "Fast daily cleanup (~20s)", "5 tasks · safe for everyday use"},
-		{"🔥", "Deep Clean", "Full system cleanup (~90s)", "11 tasks · requires sudo"},
+		{"🌿", "Shallow Clean", "Fast daily cleanup (~20s)",
+			fmt.Sprintf("%d tasks · safe for everyday use", len(tasks.ShallowTasks()))},
+		{"🔥", "Deep Clean", "Full system cleanup (~90s)",
+			fmt.Sprintf("%d tasks · requires sudo", len(tasks.DeepTasks()))},
 	}
 	for i, mode := range modes {
 		marker := pendStyle.Render("( )")
@@ -316,6 +448,30 @@ func (m model) sudoView() string {
 	return RenderBox(BoxWarning, "🔒  Sudo password required", b.String())
 }
 
+// renderTaskRow renders a single task line for run/summary views. The
+// spinner view is passed in so callers share one spinner instance.
+func renderTaskRow(t tasks.Task, spinnerView string) string {
+	var mark, name string
+	switch t.Status {
+	case tasks.StatusDone:
+		mark = doneStyle.Render("✅")
+		name = doneStyle.Render(t.Name)
+	case tasks.StatusRunning:
+		mark = runStyle.Render(spinnerView)
+		name = runStyle.Render(t.Name)
+	case tasks.StatusError:
+		mark = errStyle.Render("❌")
+		name = errStyle.Render(t.Name)
+	case tasks.StatusSkipped:
+		mark = pendStyle.Render("⊘")
+		name = pendStyle.Render(t.Name + "  (skipped)")
+	default:
+		mark = pendStyle.Render("·")
+		name = pendStyle.Render(t.Name)
+	}
+	return fmt.Sprintf("  %s  %s\n", mark, name)
+}
+
 func (m model) runView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("🧹  Linux Cleanup CLI") + "  " +
@@ -323,22 +479,7 @@ func (m model) runView() string {
 	b.WriteString("\n\n")
 
 	for _, t := range m.tasks {
-		var mark, name string
-		switch t.Status {
-		case tasks.StatusDone:
-			mark = doneStyle.Render("✅")
-			name = doneStyle.Render(t.Name)
-		case tasks.StatusRunning:
-			mark = runStyle.Render(m.spinner.View())
-			name = runStyle.Render(t.Name)
-		case tasks.StatusError:
-			mark = errStyle.Render("❌")
-			name = errStyle.Render(t.Name)
-		default:
-			mark = pendStyle.Render("·")
-			name = pendStyle.Render(t.Name)
-		}
-		b.WriteString(fmt.Sprintf("  %s  %s\n", mark, name))
+		b.WriteString(renderTaskRow(t, m.spinner.View()))
 	}
 
 	n := len(m.tasks)
@@ -348,33 +489,86 @@ func (m model) runView() string {
 	return b.String()
 }
 
-func (m model) doneView() string {
+// successBody returns the one-line summary shown on the done screen and in
+// the goodbye card printed after exit.
+func (m model) successBody() string {
 	count := len(m.tasks)
 	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
-	body := fmt.Sprintf("%d tasks completed in %s", count, elapsed)
-	return SuccessCard("Done", body) + "\n"
+	return fmt.Sprintf("%d tasks completed in %s", count, elapsed)
 }
 
-func (m model) errorView() string {
+func (m model) doneView() string {
+	return SuccessCard("Done", m.successBody()) + "\n"
+}
+
+func (m model) summaryView() string {
 	var b strings.Builder
 	for _, t := range m.tasks {
-		var mark, name string
-		switch t.Status {
-		case tasks.StatusDone:
-			mark = doneStyle.Render("✅")
-			name = doneStyle.Render(t.Name)
-		case tasks.StatusError:
-			mark = errStyle.Render("❌")
-			name = errStyle.Render(t.Name + "  ← failed here")
-		default:
-			mark = pendStyle.Render("·")
-			name = pendStyle.Render(t.Name)
-		}
-		b.WriteString(fmt.Sprintf("  %s  %s\n", mark, name))
+		b.WriteString(renderTaskRow(t, m.spinner.View()))
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("Error: %s\n", errStyle.Render(m.errMsg)))
-	b.WriteString(hintStyle.Render("Tip: ensure sudo is available and disk is writable"))
-	card := ErrorCard("Task Failed", b.String())
-	return card + "\n" + hintStyle.Render("press any key to exit")
+
+	done := countDone(m.tasks)
+	failed := len(m.failedTasks)
+	skipped := len(m.skippedTasks)
+	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
+	b.WriteString(modeBadgeStyle.Render(fmt.Sprintf(
+		"%d done · %d failed · %d skipped · %s", done, failed, skipped, elapsed)))
+	b.WriteString("\n\n")
+
+	if m.lastErr != "" {
+		b.WriteString(errStyle.Render(m.lastErr))
+		b.WriteString("\n\n")
+	}
+
+	if failed > 0 {
+		b.WriteString(hintStyle.Render("r retry failed   q quit"))
+	} else {
+		b.WriteString(hintStyle.Render("press any key to exit"))
+	}
+	return WarningCard("Cleanup Summary", b.String()) + "\n"
+}
+
+// finalMessage returns the card to print after the program exits so the
+// result lingers in the terminal scrollback. Returns "" for states that
+// should leave the terminal untouched (early quit at select/sudo screens).
+func (m model) finalMessage() string {
+	switch m.screen {
+	case screenDone:
+		return SuccessCard("Done", m.successBody())
+	case screenSummary:
+		return m.summaryFinalCard()
+	}
+	return ""
+}
+
+// summaryFinalCard renders the summary without the interactive hints, since
+// those are meaningless once the program has exited.
+func (m model) summaryFinalCard() string {
+	var b strings.Builder
+	for _, t := range m.tasks {
+		b.WriteString(renderTaskRow(t, ""))
+	}
+	b.WriteString("\n")
+	done := countDone(m.tasks)
+	failed := len(m.failedTasks)
+	skipped := len(m.skippedTasks)
+	elapsed := m.endTime.Sub(m.startTime).Round(time.Second)
+	b.WriteString(modeBadgeStyle.Render(fmt.Sprintf(
+		"%d done · %d failed · %d skipped · %s", done, failed, skipped, elapsed)))
+	if m.lastErr != "" {
+		b.WriteString("\n\n")
+		b.WriteString(errStyle.Render(m.lastErr))
+	}
+	return WarningCard("Cleanup Summary", b.String())
+}
+
+// FinalMessage is the exported goodbye-card accessor used by main after the
+// program returns. It type-asserts the final tea.Model back to the concrete
+// model and returns its finalMessage, or "" if the assertion fails.
+func FinalMessage(m tea.Model) string {
+	if mm, ok := m.(model); ok {
+		return mm.finalMessage()
+	}
+	return ""
 }

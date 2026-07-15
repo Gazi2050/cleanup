@@ -59,7 +59,7 @@ sudo mv cleanup /usr/local/bin/ && sudo chmod +x /usr/local/bin/cleanup
 Run `cleanup` and select a mode:
 
 - **Shallow** — 5 tasks, ~20s (safe for daily use)
-- **Deep** — 11 tasks, ~90s (full system cleanup, requires sudo)
+- **Deep** — 12 tasks, ~90s (full system cleanup, requires sudo)
 
 Navigate with `↑↓` / `kj`, confirm with `enter`, quit with `q` or `ctrl+c`.
 
@@ -70,11 +70,14 @@ Navigate with `↑↓` / `kj`, confirm with `enter`, quit with `q` or `ctrl+c`.
 - Vacuum journals (3 days)
 - APT autoclean
 
-**Deep Clean** — 11 tasks, ~90s `full system`
-- APT: update, upgrade, full-upgrade, autoremove, clean
-- Clear /tmp, /var/tmp, caches
-- Clean npm & pnpm cache
+**Deep Clean** — 12 tasks, ~90s `full system`
+- APT: update, full-upgrade, autoremove, clean
+- Clear /tmp, /var/tmp, caches (preserves live sockets)
+- Clean + update global npm packages
+- Prune pnpm store + update global pnpm packages
 - Vacuum journals
+
+A run never aborts on the first failure. Tasks that error or skip (e.g. `npm`/`pnpm` not installed) are marked and the run continues, ending on a summary with a `r retry failed` option. apt commands wait up to 5 minutes for the dpkg lock (so they no longer collide with `unattended-upgrades`) and run fully non-interactively.
 
 ## Stack
 

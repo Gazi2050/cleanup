@@ -24,8 +24,12 @@ func main() {
 	}
 
 	p := tea.NewProgram(ui.InitialModel())
-	if _, err := p.Run(); err != nil {
+	m, err := p.Run()
+	if err != nil {
 		fmt.Printf("Alas, there's been an error: %v\n", err)
 		os.Exit(1)
+	}
+	if msg := ui.FinalMessage(m); msg != "" {
+		fmt.Println(msg)
 	}
 }

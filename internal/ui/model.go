@@ -315,7 +315,10 @@ func validateSudo(pw string) tea.Cmd {
 // several minutes during a big upgrade; everything else is capped at a minute
 // so a hung command never freezes the TUI indefinitely.
 func taskTimeout(command string) time.Duration {
-	if strings.Contains(command, "apt ") {
+	switch {
+	case strings.Contains(command, "apt "),
+		strings.Contains(command, "npm "),
+		strings.Contains(command, "pnpm "):
 		return 5 * time.Minute
 	}
 	return 60 * time.Second
@@ -328,9 +331,13 @@ const sudoRefreshInterval = 60 * time.Second
 func (m model) runTask(idx int) tea.Cmd {
 	t := m.tasks[idx]
 	return func() tea.Msg {
-		if t.Require != "" {
-			if _, err := exec.LookPath(t.Require); err != nil {
-				return taskSkippedMsg{idx: idx, msg: t.Require + " not installed"}
+		bin := t.Require
+		if bin == "" {
+			bin = tasks.ExtractBinary(t.Command)
+		}
+		if bin != "" {
+			if _, err := exec.LookPath(bin); err != nil {
+				return taskSkippedMsg{idx: idx, msg: bin + " not installed"}
 			}
 		}
 		timeout := taskTimeout(t.Command)

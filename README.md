@@ -71,13 +71,10 @@ Navigate with `↑↓` / `kj`, confirm with `enter`, quit with `q` or `ctrl+c`.
 - APT autoclean
 
 **Deep Clean** — 12 tasks, ~90s `full system`
-- APT: update, full-upgrade, autoremove, clean
-- Clear /tmp, /var/tmp, caches (preserves live sockets)
-- Clean + update global npm packages
-- Prune pnpm store + update global pnpm packages
-- Vacuum journals
+- Updates: APT update, APT full-upgrade, global npm + pnpm packages
+- Cleanups: APT autoremove + clean, npm cache, pnpm store, /tmp + /var/tmp, user caches, .tmp files, vacuum journals (preserves live sockets)
 
-A run never aborts on the first failure. Tasks that error or skip (e.g. `npm`/`pnpm` not installed) are marked and the run continues, ending on a summary with a `r retry failed` option. apt commands wait up to 5 minutes for the dpkg lock (so they no longer collide with `unattended-upgrades`) and run fully non-interactively.
+A run never aborts on the first failure. Tasks whose required tool is missing (`apt`, `npm`, `pnpm`, `journalctl`, `find`, etc.) are auto-detected and skipped, and the run continues, ending on a summary with a `r retry failed` option. apt commands wait up to 5 minutes for the dpkg lock (so they no longer collide with `unattended-upgrades`) and run fully non-interactively. apt/npm/pnpm tasks get a 5-minute budget; other tasks cap at 60s so a hung command never freezes the TUI.
 
 ## Stack
 
